@@ -106,18 +106,19 @@ def add_covs(pca, sid_to_covs):
         pca[cov_name] = pca['sid'].map(sid_to_covs[cov_name])
     return ['sid'] + cov_names
 
-def collapse_markers(normeddir, markers, pseudomarker, outdir, masksdir=None):
+def collapse_markers(normeddir, markers, outdir, pseudomarker=None, masksdir=None):
     """
-    Keep a subset of markers and fold all the others into one pseudomarker.
+    Keep a subset of markers and optionally fold all the others into one pseudomarker.
 
     Reads the normalized pixel matrices written by `prepare_merfish`,
     `prepare_xenium5k`, or `nonst.prepare` (for transcriptomic data the markers
-    are genes), retains `markers`, and replaces every other marker with a single
-    channel named `pseudomarker` holding their combined signal. Because the
-    stored values are log-normalized, they are exponentiated, summed, and
-    log-normalized again, so the pseudomarker is on the same scale as a real
-    marker. The dataset-wide means and stds stored on each file are rewritten to
-    match the new marker set: retained markers keep their existing values and the
+    are genes) and retains `markers`. If `pseudomarker` is given, every other
+    marker is replaced with a single channel of that name holding their combined
+    signal; otherwise the other markers are simply dropped. Because the stored
+    values are log-normalized, they are exponentiated, summed, and log-normalized
+    again, so the pseudomarker is on the same scale as a real marker. The
+    dataset-wide means and stds stored on each file are rewritten to match the
+    new marker set: retained markers keep their existing values and the
     pseudomarker's are computed from the collapsed data.
 
     Parameters
@@ -125,19 +126,21 @@ def collapse_markers(normeddir, markers, pseudomarker, outdir, masksdir=None):
     normeddir
         Directory of normalized ``.nc`` files, e.g. ``{outdir}/normalized``.
     markers
-        Markers to retain, in the order they should appear; the pseudomarker is
-        appended after them. Markers absent from the data are skipped with a
-        warning.
-    pseudomarker
-        Name for the new channel, e.g. ``'nonimmune'``.
+        Markers to retain, in the order they should appear; the pseudomarker, if
+        any, is appended after them. Markers absent from the data are skipped with
+        a warning.
     outdir
         Directory to write the collapsed ``.nc`` files to. This is a
         ``normalized``-style directory, so to build a dataset that
         `pca_pixels` can be pointed at, pass ``f'{newroot}/normalized'`` and copy
         the masks to ``f'{newroot}/masks'``.
+    pseudomarker
+        Name for the new channel, e.g. ``'nonimmune'``. If None, no pseudomarker
+        is created and the markers not in `markers` are discarded.
     masksdir
         Directory of tissue masks, used to compute the pseudomarker's moments
         over non-empty pixels only. Defaults to ``masks`` alongside `normeddir`.
+        Unused if `pseudomarker` is None.
     """
     import netCDF4
 
@@ -157,7 +160,7 @@ def collapse_markers(normeddir, markers, pseudomarker, outdir, masksdir=None):
     ref_means, ref_stds = da.attrs['means'], da.attrs['stds']
     da.close(); del da
 
-    if pseudomarker in ref_markers:
+    if pseudomarker is not None and pseudomarker in ref_markers:
         raise ValueError(f"'{pseudomarker}' is already a marker; pick a name for the "
                          f"pseudomarker that isn't in the data.")
     missing = [m for m in markers if m not in ref_markers]
@@ -167,17 +170,20 @@ def collapse_markers(normeddir, markers, pseudomarker, outdir, masksdir=None):
     keep = [m for m in markers if m in ref_markers]
     if len(keep) == 0:
         raise ValueError('None of the requested markers are in the data.')
-    if len(keep) == len(ref_markers):
-        logger.warning(f'All {len(ref_markers)} markers were retained, so {pseudomarker} will be '
-                       f'empty.')
-    logger.info(f'Keeping {len(keep)} markers and collapsing the other '
-                f'{len(ref_markers) - len(keep)} into {pseudomarker}.')
+    if pseudomarker is None:
+        logger.info(f'Keeping {len(keep)} markers and dropping the other '
+                    f'{len(ref_markers) - len(keep)}.')
+    else:
+        if len(keep) == len(ref_markers):
+            logger.warning(f'All {len(ref_markers)} markers were retained, so {pseudomarker} '
+                           f'will be empty.')
+        logger.info(f'Keeping {len(keep)} markers and collapsing the other '
+                    f'{len(ref_markers) - len(keep)} into {pseudomarker}.')
 
     # collapse each sample, accumulating the pseudomarker's per-sample moments as we go
     sample_sids, sample_means, sample_stds, sample_npixels = [], [], [], []
     for sid in settings.progress(sids, name='collapsing markers'):
         da = xr.open_dataarray(f'{normeddir}/{sid}.nc')
-        mask_da = xr.open_dataarray(f'{masksdir}/{sid}.nc')
 
         sid_markers = list(da.marker.values)
         if sid_markers != ref_markers:
@@ -195,9 +201,17 @@ def collapse_markers(normeddir, markers, pseudomarker, outdir, masksdir=None):
         # full (H x W x n_markers) copies simultaneously
         x = da.x.values; y = da.y.values
         data = da.values
-        mask = mask_da.values
-        da.close(); mask_da.close()
-        del da, mask_da; gc.collect()
+        da.close(); del da; gc.collect()
+
+        if pseudomarker is None:
+            s = xr.DataArray(
+                data[..., keep_ix],
+                dims=['y', 'x', 'marker'],
+                coords={'x': x, 'y': y, 'marker': keep})
+            s.name = sid
+            util.write_xarray(s, f'{outdir}/{sid}.nc')
+            del data, s; gc.collect()
+            continue
 
         # accumulate the dropped markers one at a time: fancy-indexing them all at
         # once would materialize the (y, x, n_dropped) copy this function exists to
@@ -221,6 +235,8 @@ def collapse_markers(normeddir, markers, pseudomarker, outdir, masksdir=None):
 
         # a sample with an empty mask contributes nothing rather than a nan that
         # would poison the pooled moments
+        with xr.open_dataarray(f'{masksdir}/{sid}.nc') as mask_da:
+            mask = mask_da.values
         vals = other[mask]
         if len(vals) == 0:
             logger.warning(f'{sid} has no non-empty pixels; excluding it from the '
@@ -232,29 +248,34 @@ def collapse_markers(normeddir, markers, pseudomarker, outdir, masksdir=None):
             sample_npixels.append(len(vals))
         del other, mask, vals; gc.collect()
 
-    if len(sample_sids) == 0:
-        raise ValueError(f'No non-empty pixels in any sample, so {pseudomarker} has no moments. '
-                         f'Check that {masksdir} holds the masks for {normeddir}.')
+    keep_ix_ref = [ref_markers.index(m) for m in keep]
+    means = np.asarray(ref_means)[keep_ix_ref]
+    stds = np.asarray(ref_stds)[keep_ix_ref]
 
-    # pool the pseudomarker's moments across samples the same way get_sumstats does
-    pseudo_mean, pseudo_std = util.pool_moments(
-        pd.DataFrame([sample_means], index=[pseudomarker], columns=sample_sids),
-        pd.DataFrame([sample_stds],  index=[pseudomarker], columns=sample_sids),
-        sample_npixels)
-    pseudo_mean, pseudo_std = pseudo_mean.iloc[0], pseudo_std.iloc[0]
-    if pseudo_std == 0:
-        # a constant channel stays exactly 0 after standardization rather than
-        # dividing by zero downstream
-        logger.warning(f'{pseudomarker} has zero variance; setting its std to 1.')
-        pseudo_std = 1.
-    logger.info(f'{pseudomarker}: mean {pseudo_mean:.3f}, std {pseudo_std:.3f}')
+    if pseudomarker is not None:
+        if len(sample_sids) == 0:
+            raise ValueError(f'No non-empty pixels in any sample, so {pseudomarker} has no '
+                             f'moments. Check that {masksdir} holds the masks for {normeddir}.')
+
+        # pool the pseudomarker's moments across samples the same way get_sumstats does
+        pseudo_mean, pseudo_std = util.pool_moments(
+            pd.DataFrame([sample_means], index=[pseudomarker], columns=sample_sids),
+            pd.DataFrame([sample_stds],  index=[pseudomarker], columns=sample_sids),
+            sample_npixels)
+        pseudo_mean, pseudo_std = pseudo_mean.iloc[0], pseudo_std.iloc[0]
+        if pseudo_std == 0:
+            # a constant channel stays exactly 0 after standardization rather than
+            # dividing by zero downstream
+            logger.warning(f'{pseudomarker} has zero variance; setting its std to 1.')
+            pseudo_std = 1.
+        logger.info(f'{pseudomarker}: mean {pseudo_mean:.3f}, std {pseudo_std:.3f}')
+        means = np.append(means, pseudo_mean)
+        stds = np.append(stds, pseudo_std)
 
     # the pseudomarker's moments aren't known until every sample has been read, so
     # the files are written above without them and stamped here; this rewrites
     # metadata only, rather than re-collapsing every sample a second time
-    keep_ix_ref = [ref_markers.index(m) for m in keep]
-    means = np.append(np.asarray(ref_means)[keep_ix_ref], pseudo_mean).astype(np.float32)
-    stds  = np.append(np.asarray(ref_stds)[keep_ix_ref],  pseudo_std).astype(np.float32)
+    means, stds = means.astype(np.float32), stds.astype(np.float32)
     for sid in sids:
         with netCDF4.Dataset(f'{outdir}/{sid}.nc', 'a') as ds:
             v = ds.variables[sid]

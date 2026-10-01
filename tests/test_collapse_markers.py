@@ -55,7 +55,7 @@ def dataset(tmp_path_factory):
 def collapsed(dataset, tmp_path_factory):
     """Run collapse_markers once, including a marker that isn't in the data."""
     outdir = str(tmp_path_factory.mktemp("collapsed"))
-    vima.pp.collapse_markers(dataset["normeddir"], KEEP + ["NOT_A_GENE"], "other", outdir)
+    vima.pp.collapse_markers(dataset["normeddir"], KEEP + ["NOT_A_GENE"], outdir, "other")
     return outdir
 
 
@@ -115,14 +115,28 @@ def test_pseudomarker_moments_are_pooled_over_masked_pixels(dataset, collapsed):
             assert np.isclose(s.attrs["stds"][-1], exp_std.iloc[0], atol=1e-5)
 
 
+def test_no_pseudomarker_drops_the_rest(dataset, tmp_path):
+    """Without a pseudomarker the other markers are simply dropped."""
+    outdir = str(tmp_path / "subset")
+    vima.pp.collapse_markers(dataset["normeddir"], KEEP, outdir)
+    for sid in SHAPES:
+        with xr.open_dataarray(f"{outdir}/{sid}.nc") as s:
+            assert list(s.marker.values) == KEEP
+            for m in KEEP:
+                assert np.array_equal(s.sel(marker=m).values,
+                                      dataset["src"][sid].sel(marker=m).values)
+            assert np.array_equal(s.attrs["means"], dataset["means"][KEEP].values.astype(np.float32))
+            assert np.array_equal(s.attrs["stds"], dataset["stds"][KEEP].values.astype(np.float32))
+
+
 def test_name_collision_raises(dataset, tmp_path):
     with pytest.raises(ValueError, match="already a marker"):
-        vima.pp.collapse_markers(dataset["normeddir"], KEEP, "CD3E", str(tmp_path / "bad"))
+        vima.pp.collapse_markers(dataset["normeddir"], KEEP, str(tmp_path / "bad"), "CD3E")
 
 
 def test_no_retained_markers_raises(dataset, tmp_path):
     with pytest.raises(ValueError, match="None of the requested markers"):
-        vima.pp.collapse_markers(dataset["normeddir"], ["NOPE"], "other", str(tmp_path / "bad"))
+        vima.pp.collapse_markers(dataset["normeddir"], ["NOPE"], str(tmp_path / "bad"), "other")
 
 
 def test_output_feeds_the_standardization_path(dataset, collapsed):
