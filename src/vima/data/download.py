@@ -6,7 +6,9 @@ from urllib.request import urlopen, Request
 
 from .._settings import settings, logger
 
-__all__ = ["download_zenodo"]
+__all__ = ["download_zenodo",
+           "download_toy_rawdata",
+           "download_toy_metadata_and_fingerprints"]
 
 
 def download_zenodo(record_id, target_dir, chunk_size=1024 * 1024):
