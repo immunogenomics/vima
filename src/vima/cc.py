@@ -415,7 +415,8 @@ def association(ds, y, sid_name, batches=None, covs=None, donorids=None, key_add
     kept = np.logical_and.reduce(kepts)
 
     for i in range(len(MAMs_filtered)):
-        MAMs_filtered[i] = MAMs_filtered[i].iloc[:,kept]
+        # select by label: each frame has already lost its own QC'd columns, so kept's positions don't line up
+        MAMs_filtered[i] = MAMs_filtered[i].loc[:, MAMs[i].columns[kept]]
 
     # residualize NAMs
     MAMs_concat = pd.concat(MAMs_filtered, axis=1)
